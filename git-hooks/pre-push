@@ -11,6 +11,9 @@
 # Enabled via: git config --global core.hooksPath ~/.config/git/hooks
 # Skip the audit once: SECURITY_SKIP=1 git push   (or git push --no-verify)
 # Tuning: SECURITY_SEMGREP_SEVERITY (default ERROR), SECURITY_TRIVY_SEVERITY (default HIGH,CRITICAL)
+# The scanned repository cannot silence the audit: its own scanner configuration and
+# suppressions (.gitleaks.toml, .gitleaksignore, .semgrepignore, nosemgrep comments,
+# .trivyignore, trivy.yaml) are ignored. Set SECURITY_TRUST_REPO_CONFIG=1 to honour them.
 
 set -u
 export PATH="$HOME/.local/bin:$PATH"
@@ -46,6 +49,19 @@ scanned_any=0
 n=0
 manifests='(^|/)(package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|pubspec\.lock|requirements[^/]*\.txt|poetry\.lock|Pipfile\.lock|uv\.lock|Gemfile\.lock|composer\.lock|go\.(mod|sum)|Cargo\.lock|pom\.xml|[^/]*\.gradle(\.kts)?|gradle\.lockfile)$'
 
+trust_repo="${SECURITY_TRUST_REPO_CONFIG:-0}"
+gitleaks_opts=()
+semgrep_opts=()
+trivy_opts=()
+if [ "$trust_repo" != "1" ]; then
+  # Built-in gitleaks rules only, and an empty folder as the place to look for .gitleaksignore.
+  printf '[extend]\nuseDefault = true\n' >"$work/gitleaks.toml"
+  mkdir -p "$work/no-ignore"
+  gitleaks_opts=(--config "$work/gitleaks.toml" --gitleaks-ignore-path "$work/no-ignore")
+  semgrep_opts=(--disable-nosem)
+  trivy_opts=(--ignorefile "" --config "")
+fi
+
 # Writes the version of each listed file AS IT IS IN THE PUSHED COMMIT into a scratch
 # directory. The scanners then read that copy, so the audit covers exactly what is
 # pushed (not the working tree, which may differ), and no repository file name is ever
@@ -55,17 +71,23 @@ export_files() {
   local f
   while IFS= read -r -d '' f; do
     case "$f" in /* | ../* | */../* | */..) continue ;; esac
+    if [ "$trust_repo" != "1" ]; then
+      case "${f##*/}" in .semgrepignore | .trivyignore | trivy.yaml | trivy.yml) continue ;; esac
+    fi
     mkdir -p -- "$2/$(dirname -- "$f")" 2>/dev/null || continue
     git show "$1:$f" >"$2/$f" 2>/dev/null || rm -f "$2/$f" # e.g. submodule entry
   done
 }
 
 # Keep a copy of everything the audit prints.
+# Reports quote the flagged source lines: readable by the current user only.
 report_dir="${XDG_STATE_HOME:-$HOME/.local/state}/security-audits"
 mkdir -p "$report_dir"
+chmod 700 "$report_dir" 2>/dev/null || true
 report="$report_dir/$(basename "$root")-$(date +%Y%m%d-%H%M%S).log"
+(umask 077 && : >"$report")
 exec 3>&2
-exec 2> >(tee "$report" >&3)
+exec 2> >(tee -a "$report" >&3)
 
 while read -r _lref lsha _rref rsha; do
   [ -z "${lsha:-}" ] && continue
@@ -95,7 +117,7 @@ while read -r _lref lsha _rref rsha; do
 
   if command -v gitleaks >/dev/null 2>&1; then
     echo "🔐 security audit: secrets scan (gitleaks)…" >&2
-    if ! gitleaks git --log-opts="$log_opts" --redact --verbose --no-banner --exit-code 1 . >&2; then
+    if ! gitleaks git "${gitleaks_opts[@]}" --log-opts="$log_opts" --redact --verbose --no-banner --exit-code 1 . >&2; then
       failed=1
     fi
   else
@@ -105,6 +127,11 @@ while read -r _lref lsha _rref rsha; do
   mkdir -p "$work/code-$n"
   git diff -z --name-only --diff-filter=ACMR "$base" "$lsha" >"$work/changed-$n" 2>/dev/null
   export_files "$lsha" "$work/code-$n" <"$work/changed-$n"
+  if [ "$trust_repo" != "1" ]; then
+    # An empty .semgrepignore at the scan root replaces semgrep's default exclusions
+    # (tests/, vendored folders, …): every pushed file is audited.
+    : >"$work/code-$n/.semgrepignore"
+  fi
   if grep -zEq "$manifests" "$work/changed-$n"; then
     # A manifest changed: audit every dependency manifest of the pushed commit.
     mkdir -p "$work/deps-$n"
@@ -114,12 +141,12 @@ done <<<"$stdin_data"
 
 if [ "$scanned_any" = "0" ]; then rm -f "$report"; chain "$@"; fi
 
-code_files="$(find "$work" -path "$work/code-*" -type f 2>/dev/null | wc -l)"
+code_files="$(find "$work" -path "$work/code-*" -type f ! -name .semgrepignore 2>/dev/null | wc -l)"
 if [ "$code_files" -gt 0 ]; then
   if command -v semgrep >/dev/null 2>&1; then
     echo "🛡️  security audit: code scan (semgrep, $code_files changed file(s), as pushed)…" >&2
     # Targets are scratch directories named by this script (code-1, code-2, …).
-    if ! (cd "$work" && semgrep scan \
+    if ! (cd "$work" && semgrep scan "${semgrep_opts[@]}" \
       --config p/owasp-top-ten --config p/cwe-top-25 \
       --severity "${SECURITY_SEMGREP_SEVERITY:-ERROR}" \
       --error --quiet --metrics=off --disable-version-check code-*) >&2; then
@@ -134,9 +161,10 @@ for deps in "$work"/deps-*; do
   [ -d "$deps" ] || continue
   if command -v trivy >/dev/null 2>&1; then
     echo "📦 security audit: dependency scan (trivy)…" >&2
-    if ! trivy fs --scanners vuln \
+    # Run from the scratch directory so no trivy.yaml or .trivyignore of the repository applies.
+    if ! (cd "$work" && trivy fs "${trivy_opts[@]}" --scanners vuln \
       --severity "${SECURITY_TRIVY_SEVERITY:-HIGH,CRITICAL}" \
-      --ignore-unfixed --exit-code 1 --quiet "$deps" >&2; then
+      --ignore-unfixed --exit-code 1 --quiet "$deps") >&2; then
       failed=1
     fi
   else

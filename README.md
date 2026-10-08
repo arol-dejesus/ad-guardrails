@@ -153,6 +153,13 @@ Le hook git est en **mode audit** : il affiche les failles trouvées, enregistre
 - Refuser le push en cas de faille : `SECURITY_ENFORCE=1 git push`
 - Sauter l'audit une fois : `SECURITY_SKIP=1 git push`
 
+L'audit lit les fichiers tels qu'ils sont dans le commit poussé, pas dans le dossier de travail.
+Le dépôt analysé ne peut pas le faire taire : sa propre configuration des scanners et ses
+exclusions (`.gitleaks.toml`, `.gitleaksignore`, `.semgrepignore`, commentaires `nosemgrep`,
+`.trivyignore`, `trivy.yaml`) sont ignorées, et les dossiers de tests sont analysés aussi.
+Pour les prendre en compte : `SECURITY_TRUST_REPO_CONFIG=1 git push`. Les rapports citent les
+lignes de code signalées : ils ne sont lisibles que par ton compte.
+
 Comme `core.hooksPath` global fait ignorer à git les hooks propres à chaque dépôt, des relais
 les exécutent quand ils existent.
 
