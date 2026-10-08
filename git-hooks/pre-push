@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Global security audit — runs before every `git push` on this machine.
+# By default it does NOT block: it prints an audit of the commits being pushed,
+# saves it under ~/.local/state/security-audits/, and lets the push through.
+# Set SECURITY_ENFORCE=1 to refuse the push when the audit finds:
+#   1. secrets            (gitleaks, on the pushed commit range)
+#   2. vulnerable code    (semgrep p/owasp-top-ten + p/cwe-top-25, on changed files,
+#                          read from the pushed commit, not from the working tree)
+#   3. vulnerable deps    (trivy HIGH/CRITICAL with a fix available, when a manifest changed)
+#
+# Enabled via: git config --global core.hooksPath ~/.config/git/hooks
+# Skip the audit once: SECURITY_SKIP=1 git push   (or git push --no-verify)
+# Tuning: SECURITY_SEMGREP_SEVERITY (default ERROR), SECURITY_TRIVY_SEVERITY (default HIGH,CRITICAL)
+
+set -u
+export PATH="$HOME/.local/bin:$PATH"
+
+remote="${1:-origin}"
+stdin_data="$(cat)"
+
+chain() {
+  # Hand over to the repository's own pre-push hook, if it has one.
+  local h
+  h="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/pre-push"
+  if [ -x "$h" ]; then
+    printf '%s\n' "$stdin_data" | "$h" "$@"
+    exit $?
+  fi
+  exit 0
+}
+
+if [ "${SECURITY_SKIP:-0}" = "1" ]; then
+  echo "⚠️  security gate: SECURITY_SKIP=1 — scan skipped for this push." >&2
+  chain "$@"
+fi
+
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || chain "$@"
+cd "$root" || chain "$@"
+
+zero="0000000000000000000000000000000000000000"
+empty_tree="$(git hash-object -t tree /dev/null)"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+failed=0
+scanned_any=0
+n=0
+manifests='(^|/)(package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|pubspec\.lock|requirements[^/]*\.txt|poetry\.lock|Pipfile\.lock|uv\.lock|Gemfile\.lock|composer\.lock|go\.(mod|sum)|Cargo\.lock|pom\.xml|[^/]*\.gradle(\.kts)?|gradle\.lockfile)$'
+
+# Writes the version of each listed file AS IT IS IN THE PUSHED COMMIT into a scratch
+# directory. The scanners then read that copy, so the audit covers exactly what is
+# pushed (not the working tree, which may differ), and no repository file name is ever
+# passed to a scanner as a command-line argument.
+# $1 = commit, $2 = destination directory, stdin = NUL-separated paths.
+export_files() {
+  local f
+  while IFS= read -r -d '' f; do
+    case "$f" in /* | ../* | */../* | */..) continue ;; esac
+    mkdir -p -- "$2/$(dirname -- "$f")" 2>/dev/null || continue
+    git show "$1:$f" >"$2/$f" 2>/dev/null || rm -f "$2/$f" # e.g. submodule entry
+  done
+}
+
+# Keep a copy of everything the audit prints.
+report_dir="${XDG_STATE_HOME:-$HOME/.local/state}/security-audits"
+mkdir -p "$report_dir"
+report="$report_dir/$(basename "$root")-$(date +%Y%m%d-%H%M%S).log"
+exec 3>&2
+exec 2> >(tee "$report" >&3)
+
+while read -r _lref lsha _rref rsha; do
+  [ -z "${lsha:-}" ] && continue
+  [ "$lsha" = "$zero" ] && continue # branch deletion: nothing to scan
+  # Only object ids are expected here; anything else is ignored rather than interpreted.
+  case "$lsha$rsha" in *[!0-9a-f]*) continue ;; esac
+
+  if [ "$rsha" != "$zero" ] && git cat-file -e "$rsha^{commit}" 2>/dev/null; then
+    log_opts="$rsha..$lsha"
+    base="$rsha"
+  else
+    # New branch (or unknown remote tip): everything not already on the remote.
+    case "$remote" in
+      *[!A-Za-z0-9._/-]* | -*) log_opts="$lsha" ;; # pushed to a URL: no remote refs to exclude
+      *) log_opts="$lsha --not --remotes=$remote" ;;
+    esac
+    # shellcheck disable=SC2086
+    oldest="$(git rev-list $log_opts | tail -n 1)"
+    [ -z "$oldest" ] && continue
+    base="$(git rev-parse -q --verify "$oldest^" 2>/dev/null || echo "$empty_tree")"
+  fi
+
+  # shellcheck disable=SC2086
+  [ -z "$(git rev-list -n 1 $log_opts 2>/dev/null)" ] && continue
+  scanned_any=1
+  n=$((n + 1))
+
+  if command -v gitleaks >/dev/null 2>&1; then
+    echo "🔐 security audit: secrets scan (gitleaks)…" >&2
+    if ! gitleaks git --log-opts="$log_opts" --redact --verbose --no-banner --exit-code 1 . >&2; then
+      failed=1
+    fi
+  else
+    echo "⚠️  security audit: gitleaks not installed — secrets scan skipped." >&2
+  fi
+
+  mkdir -p "$work/code-$n"
+  git diff -z --name-only --diff-filter=ACMR "$base" "$lsha" >"$work/changed-$n" 2>/dev/null
+  export_files "$lsha" "$work/code-$n" <"$work/changed-$n"
+  if grep -zEq "$manifests" "$work/changed-$n"; then
+    # A manifest changed: audit every dependency manifest of the pushed commit.
+    mkdir -p "$work/deps-$n"
+    git ls-tree -r -z --name-only "$lsha" | grep -zE "$manifests" | export_files "$lsha" "$work/deps-$n"
+  fi
+done <<<"$stdin_data"
+
+if [ "$scanned_any" = "0" ]; then rm -f "$report"; chain "$@"; fi
+
+code_files="$(find "$work" -path "$work/code-*" -type f 2>/dev/null | wc -l)"
+if [ "$code_files" -gt 0 ]; then
+  if command -v semgrep >/dev/null 2>&1; then
+    echo "🛡️  security audit: code scan (semgrep, $code_files changed file(s), as pushed)…" >&2
+    # Targets are scratch directories named by this script (code-1, code-2, …).
+    if ! (cd "$work" && semgrep scan \
+      --config p/owasp-top-ten --config p/cwe-top-25 \
+      --severity "${SECURITY_SEMGREP_SEVERITY:-ERROR}" \
+      --error --quiet --metrics=off --disable-version-check code-*) >&2; then
+      failed=1
+    fi
+  else
+    echo "⚠️  security audit: semgrep not installed — code scan skipped." >&2
+  fi
+fi
+
+for deps in "$work"/deps-*; do
+  [ -d "$deps" ] || continue
+  if command -v trivy >/dev/null 2>&1; then
+    echo "📦 security audit: dependency scan (trivy)…" >&2
+    if ! trivy fs --scanners vuln \
+      --severity "${SECURITY_TRIVY_SEVERITY:-HIGH,CRITICAL}" \
+      --ignore-unfixed --exit-code 1 --quiet "$deps" >&2; then
+      failed=1
+    fi
+  else
+    echo "⚠️  security audit: trivy not installed — dependency scan skipped." >&2
+  fi
+done
+
+if [ "$failed" = "1" ]; then
+  {
+    echo
+    echo "⚠️  SECURITY AUDIT — findings above should be fixed."
+    echo "   A leaked secret must be revoked/rotated: it stays in git history."
+    echo "   Report saved: $report"
+  } >&2
+  if [ "${SECURITY_ENFORCE:-0}" = "1" ]; then
+    echo "🚫 PUSH REFUSED (SECURITY_ENFORCE=1)." >&2
+    exit 1
+  fi
+  echo "   Push allowed (audit mode). Use SECURITY_ENFORCE=1 to block instead." >&2
+  sleep 0.2 # let tee flush the report
+  chain "$@"
+fi
+
+echo "✅ security audit: no finding." >&2
+sleep 0.2
+rm -f "$report"
+chain "$@"

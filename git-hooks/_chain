@@ -1,0 +1,10 @@
+#!/bin/sh
+# core.hooksPath is set globally (for the pre-push security gate), which makes git
+# ignore each repository's own .git/hooks. This shim restores them: every hook name
+# symlinked to this file forwards to the repository's hook of the same name.
+name="$(basename "$0")"
+hook="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/$name"
+if [ -x "$hook" ]; then
+  exec "$hook" "$@"
+fi
+exit 0

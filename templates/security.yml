@@ -1,0 +1,239 @@
+name: Security audit
+
+# Audit de sécurité exécuté sur chaque push et chaque pull request.
+# Il ne bloque pas le push : il produit un rapport.
+#   - secrets      : gitleaks, sur les commits poussés
+#   - code         : semgrep, règles OWASP Top 10 + CWE Top 25
+#   - dépendances  : trivy, failles HIGH/CRITICAL ayant un correctif disponible
+# Le rapport complet est affiché dans le résumé du run. S'il y a des failles,
+# une issue « Audit de sécurité » est ouverte (ou mise à jour) et le run est
+# marqué en échec pour déclencher la notification GitHub ; l'issue est fermée
+# automatiquement quand tout est corrigé (sauf si des secrets ont été signalés :
+# ils doivent être révoqués, la fermeture est alors manuelle).
+# Les outils sont téléchargés en version figée et vérifiés par somme SHA-256.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Pas d'annulation des runs en cours : le scan de secrets ne porte que sur les commits
+# du push, donc annuler un run laisserait ses commits sans audit.
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  TRIVY_VERSION: "0.75.0"
+  TRIVY_SHA256: "c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f"
+  SEMGREP_VERSION: "1.180.0"
+
+jobs:
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install scanners
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin" "$RUNNER_TEMP/audit"
+          gh release download "v${GITLEAKS_VERSION}" -R gitleaks/gitleaks \
+            -p "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -D "$RUNNER_TEMP"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -C "$RUNNER_TEMP/bin" gitleaks
+          gh release download "v${TRIVY_VERSION}" -R aquasecurity/trivy \
+            -p "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -D "$RUNNER_TEMP"
+          echo "${TRIVY_SHA256}  $RUNNER_TEMP/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -C "$RUNNER_TEMP/bin" trivy
+          pipx install "semgrep==${SEMGREP_VERSION}"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Secrets (gitleaks)
+        id: secrets
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          zero="0000000000000000000000000000000000000000"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            range="${BASE_SHA}..${GITHUB_SHA}"
+          elif [ "$EVENT_NAME" = "push" ] && [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "$zero" ] \
+            && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            range="${BEFORE_SHA}..${GITHUB_SHA}"
+          elif [ "$EVENT_NAME" = "push" ]; then
+            # Nouvelle branche : uniquement les commits absents des autres branches.
+            range="${GITHUB_SHA} --not --exclude=${GITHUB_REF#refs/heads/} --remotes=origin"
+          else
+            range="" # déclenchement manuel : tout l'historique
+          fi
+          echo "Range: ${range:-full history}"
+          rc=0
+          gitleaks git --log-opts="$range" --redact --no-banner --exit-code 0 \
+            --report-format json --report-path "$RUNNER_TEMP/audit/gitleaks.json" . || rc=$?
+          # Un scanner en erreur ne vaut pas « aucune faille » : on le signale.
+          if [ "$rc" -ne 0 ] || ! count=$(jq -e 'length' "$RUNNER_TEMP/audit/gitleaks.json"); then
+            echo "::error::gitleaks n'a pas pu s'exécuter (code $rc)."
+            echo "error=1" >> "$GITHUB_OUTPUT"; count=0
+          fi
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+
+      - name: Code (semgrep)
+        id: code
+        run: |
+          semgrep scan \
+            --config p/owasp-top-ten --config p/cwe-top-25 \
+            --severity ERROR --metrics=off --disable-version-check \
+            --json-output="$RUNNER_TEMP/audit/semgrep.json" \
+            --text-output="$RUNNER_TEMP/audit/semgrep.txt" . || rc=$?
+          if [ "${rc:-0}" -ne 0 ] || ! count=$(jq -e '.results | length' "$RUNNER_TEMP/audit/semgrep.json"); then
+            echo "::error::semgrep n'a pas pu s'exécuter (code ${rc:-0})."
+            echo "error=1" >> "$GITHUB_OUTPUT"; count=0
+          fi
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+
+      - name: Dependencies (trivy)
+        id: deps
+        run: |
+          trivy fs --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+            --format json --output "$RUNNER_TEMP/audit/trivy.json" . || rc=$?
+          critical=0
+          if [ "${rc:-0}" -ne 0 ] || ! count=$(jq -e '[.Results[]?.Vulnerabilities[]?] | length' "$RUNNER_TEMP/audit/trivy.json"); then
+            echo "::error::trivy n'a pas pu s'exécuter (code ${rc:-0})."
+            echo "error=1" >> "$GITHUB_OUTPUT"; count=0
+          else
+            critical=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$RUNNER_TEMP/audit/trivy.json")
+            trivy convert --format table --output "$RUNNER_TEMP/audit/trivy.txt" \
+              "$RUNNER_TEMP/audit/trivy.json" || true
+          fi
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "critical=${critical}" >> "$GITHUB_OUTPUT"
+
+      - name: Audit report
+        id: report
+        env:
+          SECRETS: ${{ steps.secrets.outputs.count }}
+          CODE: ${{ steps.code.outputs.count }}
+          DEPS: ${{ steps.deps.outputs.count }}
+          DEPS_CRITICAL: ${{ steps.deps.outputs.critical }}
+          SCAN_ERRORS: ${{ steps.secrets.outputs.error }}${{ steps.code.outputs.error }}${{ steps.deps.outputs.error }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          A="$RUNNER_TEMP/audit"
+          SECRETS=${SECRETS:-0}; CODE=${CODE:-0}; DEPS=${DEPS:-0}; DEPS_CRITICAL=${DEPS_CRITICAL:-0}
+          total=$((SECRETS + CODE + DEPS))
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "scan_errors=${SCAN_ERRORS}" >> "$GITHUB_OUTPUT"
+
+          # Corps de l'issue : uniquement les compteurs et le lien (pas de détail des failles).
+          {
+            echo "Audit de sécurité du commit \`${GITHUB_SHA:0:7}\` sur \`${GITHUB_REF_NAME}\`."
+            echo
+            echo "| Contrôle | Failles |"
+            echo "|---|---|"
+            echo "| Secrets (gitleaks) | ${SECRETS} |"
+            echo "| Code (semgrep, OWASP Top 10 + CWE Top 25) | ${CODE} |"
+            echo "| Dépendances (trivy, HIGH/CRITICAL corrigeables) | ${DEPS} dont ${DEPS_CRITICAL} critiques |"
+            if [ -n "$SCAN_ERRORS" ]; then
+              echo
+              echo "**Attention : au moins un scanner n'a pas pu s'exécuter, l'audit est incomplet.**"
+            fi
+            echo
+            echo "Rapport détaillé : ${RUN_URL}"
+          } > "$A/issue.md"
+
+          # Résumé du run : compteurs + détail.
+          {
+            echo "# Audit de sécurité"
+            echo
+            cat "$A/issue.md"
+            if [ "$SECRETS" -gt 0 ]; then
+              echo; echo "## Secrets"; echo
+              echo "| Règle | Fichier | Ligne | Commit |"; echo "|---|---|---|---|"
+              jq -r '.[] | "| \(.RuleID) | `\(.File)` | \(.StartLine) | `\(.Commit[0:8])` |"' "$A/gitleaks.json"
+              echo; echo "Un secret poussé reste dans l'historique git : il faut le révoquer."
+            fi
+            if [ "$CODE" -gt 0 ]; then
+              echo; echo "## Code"; echo; echo '```'; head -c 60000 "$A/semgrep.txt"; echo '```'
+            fi
+            if [ "$DEPS" -gt 0 ]; then
+              echo; echo "## Dépendances"; echo; echo '```'; head -c 200000 "$A/trivy.txt"; echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update the audit issue
+        # Uniquement sur la branche par défaut : un audit propre sur une autre
+        # branche ne doit pas fermer l'issue ouverte pour la branche principale.
+        if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOTAL: ${{ steps.report.outputs.total }}
+          SECRETS: ${{ steps.secrets.outputs.count }}
+          SCAN_ERRORS: ${{ steps.report.outputs.scan_errors }}
+        run: |
+          A="$RUNNER_TEMP/audit"
+          marker="<!-- secrets-pending -->"
+          gh label create security-audit --color B60205 \
+            --description "Rapport d'audit de sécurité automatique" --force >/dev/null 2>&1 || true
+          # Pas de « || true » ici : si l'état de l'issue est illisible, l'étape échoue
+          # plutôt que de conclure à tort qu'il n'y a rien à suivre.
+          existing=$(gh issue list --label security-audit --state open --limit 1 --json number --jq '.[0].number // empty')
+
+          # Le scan de secrets ne porte que sur les commits poussés : un secret signalé
+          # auparavant disparaît du compteur au push suivant alors qu'il est toujours
+          # dans l'historique. On le garde en mémoire dans l'issue, qui ne se fermera
+          # alors plus automatiquement.
+          pending=0
+          if [ "${SECRETS:-0}" -gt 0 ]; then pending=1; fi
+          if [ -n "$existing" ] && gh issue view "$existing" --json body --jq .body | grep -qF -- "$marker"; then
+            pending=1
+          fi
+          if [ "$pending" = "1" ]; then
+            {
+              echo
+              echo "**Secrets à révoquer.** Un audit (celui-ci ou un précédent) a détecté des secrets poussés."
+              echo "Ils restent dans l'historique git même après suppression : révoque-les, puis ferme cette issue à la main."
+              echo "$marker"
+            } >> "$A/issue.md"
+          fi
+
+          if [ "${TOTAL:-0}" -gt 0 ] || [ -n "$SCAN_ERRORS" ] || { [ "$pending" = "1" ] && [ -n "$existing" ]; }; then
+            if [ -n "$existing" ]; then
+              gh issue edit "$existing" --body-file "$A/issue.md"
+              gh issue comment "$existing" --body "Nouvel audit : ${TOTAL:-0} faille(s) détectée(s). Voir la description mise à jour."
+            else
+              gh issue create --title "Audit de sécurité : failles à corriger" \
+                --label security-audit --body-file "$A/issue.md"
+            fi
+          elif [ -n "$existing" ]; then
+            gh issue close "$existing" --comment "Dernier audit sans faille : issue fermée automatiquement."
+          fi
+
+      - name: Mark the run as failed when findings exist
+        env:
+          TOTAL: ${{ steps.report.outputs.total }}
+          SCAN_ERRORS: ${{ steps.report.outputs.scan_errors }}
+        run: |
+          if [ -n "$SCAN_ERRORS" ]; then
+            echo "::error::Audit incomplet : au moins un scanner n'a pas pu s'exécuter."
+            exit 1
+          fi
+          if [ "${TOTAL:-0}" -gt 0 ]; then
+            echo "::error::Audit de sécurité : ${TOTAL} faille(s) à corriger (voir le résumé du run)."
+            exit 1
+          fi
+          echo "Audit de sécurité : aucune faille."

@@ -1,0 +1,19 @@
+{
+  "name": "ad-guardrails",
+  "owner": {
+    "name": "AD",
+    "url": "https://github.com/arol-dejesus"
+  },
+  "metadata": {
+    "description": "Garde-fous permanents pour Claude Code : sécurité, architecture, backend, performance et délégation aux agents.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "ad-guardrails",
+      "source": "./",
+      "description": "12 skills, 4 agents et 3 hooks qui font appliquer en permanence les règles de sécurité, d'architecture, de backend et de performance.",
+      "category": "development"
+    }
+  ]
+}

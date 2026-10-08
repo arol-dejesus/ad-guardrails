@@ -1,0 +1,19 @@
+{
+  "name": "ad-guardrails",
+  "version": "1.0.0",
+  "description": "Garde-fous permanents pour Claude Code : règles de sécurité, d'architecture, de structure, de développement backend et de performance (cible 10 000 utilisateurs), délégation aux agents selon la difficulté, et rappels automatiques à chaque session et à chaque écriture de code.",
+  "author": {
+    "name": "AD",
+    "url": "https://github.com/arol-dejesus"
+  },
+  "repository": "https://github.com/arol-dejesus/ad-guardrails",
+  "keywords": [
+    "security",
+    "owasp",
+    "architecture",
+    "backend",
+    "performance",
+    "agents",
+    "hooks"
+  ]
+}
